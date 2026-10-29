@@ -15,6 +15,10 @@ Service endpoints are **not embedded**. A public build ships placeholders; set
 them for your deployment with environment variables or
 `/etc/redhat-ai-configurator/endpoints.conf` (see below).
 
+![The installer's preflight screen](docs/tui-preflight.png)
+
+*Preflight: host checks, goose version, VPN state and service reachability.*
+
 ## What it does
 
 1. Checks the host: RHEL version, `goose` on `PATH` (1.38 or newer), the
