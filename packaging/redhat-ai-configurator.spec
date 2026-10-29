@@ -1,7 +1,7 @@
 %global debug_package %{nil}
 
 Name:           redhat-ai-configurator
-Version:        0.1.2
+Version:        0.1.3
 Release:        1%{?dist}
 Summary:        Guided installer that configures goose for Red Hat AI MaaS and EnMaaS
 
@@ -63,6 +63,9 @@ cargo test --offline --locked
 %doc README.md
 
 %changelog
+* Thu Oct 29 2026 Matthew Yee <yee.matthew@gmail.com> - 0.1.3-1
+- Fix key validation requesting /v1/models/models instead of /v1/models
+
 * Thu Oct 29 2026 Matthew Yee <yee.matthew@gmail.com> - 0.1.2-1
 - Treat HTTP 5xx during key validation as a service error, show the response
   body, and allow the user to continue

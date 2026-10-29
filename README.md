@@ -102,7 +102,7 @@ only checks the providers referenced by the existing `config.yaml`.
 ## Install
 
 ```sh
-sudo dnf install ./redhat-ai-configurator-0.1.2-1.el10.x86_64.rpm
+sudo dnf install ./redhat-ai-configurator-0.1.3-1.el10.x86_64.rpm
 ```
 
 Then run it **as yourself**, not as root:

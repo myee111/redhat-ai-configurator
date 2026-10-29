@@ -57,11 +57,10 @@ fn agent(timeout: Duration) -> ureq::Agent {
         .into()
 }
 
-fn request_models(base: &str, key: &str, style: AuthStyle) -> Result<(u16, String), String> {
-    let url = format!("{}/models", base.trim_end_matches('/'));
+fn request_models(url: &str, key: &str, style: AuthStyle) -> Result<(u16, String), String> {
     let (header_name, header_value) = style.header(key);
     let mut request = agent(TIMEOUT)
-        .get(&url)
+        .get(url)
         .header("Accept", "application/json")
         .header("User-Agent", "redhat-ai-configurator")
         .header(header_name, header_value);
@@ -82,11 +81,12 @@ fn request_models(base: &str, key: &str, style: AuthStyle) -> Result<(u16, Strin
     }
 }
 
-/// Validate a key against `{base}/models`. A rejected auth style is retried
-/// with the other header, and so is a 5xx (some gateways answer 500 for the
-/// wrong auth style). The response body of a 5xx is included so the user can
-/// see what the service actually said.
-pub fn validate(base: &str, raw_key: &str) -> Validation {
+/// Validate a key against a full models URL (for example
+/// `https://host/v1/models`). A rejected auth style is retried with the other
+/// header, and so is a 5xx (some gateways answer 500 for the wrong auth style).
+/// The response body of a 5xx is included so the user can see what the service
+/// actually said.
+pub fn validate(url: &str, raw_key: &str) -> Validation {
     let key: String = raw_key.chars().filter(|c| !c.is_whitespace()).collect();
     if key.is_empty() {
         return Validation::fail(None, "Paste your API key first.");
@@ -94,7 +94,7 @@ pub fn validate(base: &str, raw_key: &str) -> Validation {
 
     let mut attempts: Vec<(u16, String)> = Vec::new();
     for style in [AuthStyle::Bearer, AuthStyle::XApiKey] {
-        match request_models(base, &key, style) {
+        match request_models(url, &key, style) {
             Ok((status, body)) if (200..300).contains(&status) => {
                 let models = parse_models(&body);
                 let count = models.len();
@@ -236,22 +236,36 @@ mod tests {
 
     #[test]
     fn empty_key_fails_without_network() {
-        let result = validate("http://127.0.0.1:1/v1", "   ");
+        let result = validate("http://127.0.0.1:1/v1/models", "   ");
         assert!(!result.ok);
         assert!(result.status.is_none());
     }
 
-    fn serve(responses: Vec<(u16, &'static str)>) -> (String, std::thread::JoinHandle<()>) {
+    type Paths = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
+
+    fn serve(
+        responses: Vec<(u16, &'static str)>,
+    ) -> (String, Paths, std::thread::JoinHandle<()>) {
         use std::io::{Read, Write};
         use std::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
+        let paths: Paths = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = paths.clone();
         let handle = std::thread::spawn(move || {
             for (status, body) in responses {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut buffer = [0u8; 4096];
-                let _ = stream.read(&mut buffer).unwrap_or(0);
+                let read = stream.read(&mut buffer).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("")
+                    .to_string();
+                recorded.lock().unwrap().push(path);
                 let reason = match status {
                     200 => "OK",
                     401 => "Unauthorized",
@@ -266,12 +280,22 @@ mod tests {
                 let _ = stream.write_all(response.as_bytes());
             }
         });
-        (format!("http://{address}/v1"), handle)
+        (format!("http://{address}/v1/models"), paths, handle)
+    }
+
+    #[test]
+    fn requests_the_models_url_exactly_once() {
+        let (base, paths, server) = serve(vec![(200, r#"{"data":[]}"#)]);
+        let result = validate(&base, "secret");
+        server.join().unwrap();
+        assert!(result.ok);
+        let paths = paths.lock().unwrap();
+        assert_eq!(paths.as_slice(), ["/v1/models"]);
     }
 
     #[test]
     fn accepts_a_bearer_key() {
-        let (base, server) = serve(vec![(200, r#"{"data":[{"id":"m1"},{"id":"m2"}]}"#)]);
+        let (base, _paths, server) = serve(vec![(200, r#"{"data":[{"id":"m1"},{"id":"m2"}]}"#)]);
         let result = validate(&base, "secret");
         server.join().unwrap();
         assert!(result.ok);
@@ -281,7 +305,7 @@ mod tests {
 
     #[test]
     fn retries_with_x_api_key_after_401() {
-        let (base, server) = serve(vec![
+        let (base, _paths, server) = serve(vec![
             (401, ""),
             (200, r#"{"models":[{"name":"claude"}]}"#),
         ]);
@@ -294,7 +318,7 @@ mod tests {
 
     #[test]
     fn retries_with_x_api_key_after_a_server_error() {
-        let (base, server) = serve(vec![
+        let (base, _paths, server) = serve(vec![
             (500, r#"{"error":"unknown auth style"}"#),
             (200, r#"{"data":[{"id":"m1"}]}"#),
         ]);
@@ -306,7 +330,7 @@ mod tests {
 
     #[test]
     fn surfaces_a_rejected_key() {
-        let (base, server) = serve(vec![(401, ""), (401, "")]);
+        let (base, _paths, server) = serve(vec![(401, ""), (401, "")]);
         let result = validate(&base, "secret");
         server.join().unwrap();
         assert!(!result.ok);
@@ -316,7 +340,7 @@ mod tests {
 
     #[test]
     fn includes_the_body_of_a_server_error_and_redacts_the_key() {
-        let (base, server) = serve(vec![
+        let (base, _paths, server) = serve(vec![
             (500, r#"{"error":"upstream router failed","key":"secret"}"#),
             (500, r#"{"error":"upstream router failed","key":"secret"}"#),
         ]);
