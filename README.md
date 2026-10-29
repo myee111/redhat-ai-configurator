@@ -102,7 +102,7 @@ only checks the providers referenced by the existing `config.yaml`.
 ## Install
 
 ```sh
-sudo dnf install ./redhat-ai-configurator-0.1.1-1.el10.x86_64.rpm
+sudo dnf install ./redhat-ai-configurator-0.1.2-1.el10.x86_64.rpm
 ```
 
 Then run it **as yourself**, not as root:
@@ -241,6 +241,50 @@ Every model entry declares a `context_limit`. goose 1.45 requires that field
 and rejects the entire `custom_providers` directory if any single file omits
 it, so the configurator always writes it (200000 for most models, 1000000 for
 GLM, DeepSeek and Gemini).
+
+## Troubleshooting a 500 from EnMaaS
+
+A `500` from EnMaaS is the **service failing, not your key being rejected**. The
+installer now treats it that way: it shows the response body, and in the TUI you
+can continue past it (in non-interactive mode it becomes a warning unless you
+pass `--require-validation`, which exits `5`).
+
+Check these in order:
+
+1. **Base URL shape.** `ENMAAS_BASE_URL` is the host root, without `/v1`:
+   `https://enmaas.example.com`. goose appends `v1/messages`, and the Gemini
+   provider appends `/v1`. If you include `/v1`, requests become
+   `/v1/v1/messages`.
+2. **Model routing.** The Anthropic route may return 500 for a model the gateway
+   cannot route. Try a Claude model (`claude-haiku-4-5`) before assuming the key
+   is bad, and run `--list-models` to see what the service currently offers.
+3. **A broken `/models` endpoint.** It is possible for `GET /v1/models` to fail
+   while `POST /v1/messages` works. If the body says nothing about auth, run with
+   `--no-validate` and test a real session with `goose`.
+4. **VPN.** EnMaaS needs the corporate VPN on. A proxy in the way can produce a
+   500 instead of a clean network error.
+
+Capture what the gateway actually says:
+
+```sh
+curl -sS -i "$ENMAAS_BASE_URL/v1/models" \
+  -H "x-api-key: $ENMAAS_API_KEY" \
+  -H 'anthropic-version: 2023-06-01'
+
+curl -sS -i "$ENMAAS_BASE_URL/v1/messages" \
+  -H "x-api-key: $ENMAAS_API_KEY" \
+  -H 'anthropic-version: 2023-06-01' \
+  -H 'content-type: application/json' \
+  -d '{"model":"claude-haiku-4-5","max_tokens":16,"messages":[{"role":"user","content":"hi"}]}'
+```
+
+Then confirm what goose thinks it is using:
+
+```sh
+goose info --verbose
+cat ~/.config/goose/custom_providers/enmaas.json
+tail -n 50 ~/.local/state/goose/logs/*/*.log
+```
 
 ## Security
 

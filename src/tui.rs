@@ -58,6 +58,9 @@ enum KeyStatus {
     Idle,
     Checking,
     Ok(String),
+    /// The service failed (5xx); the key was not rejected, so the user may
+    /// continue at their own risk.
+    Warn(String),
     Err(String),
 }
 
@@ -105,7 +108,7 @@ impl ProviderUi {
     }
 
     fn done(&self) -> bool {
-        self.keep_existing || matches!(self.status, KeyStatus::Ok(_))
+        self.keep_existing || matches!(self.status, KeyStatus::Ok(_) | KeyStatus::Warn(_))
     }
 
     fn model(&self) -> &ModelChoice {
@@ -256,6 +259,9 @@ impl App {
                         provider.status = KeyStatus::Ok(result.message.clone());
                         provider.merge_models(result.models.clone());
                         self.advance_key();
+                    } else if result.server_error() {
+                        provider.status = KeyStatus::Warn(result.message.clone());
+                        self.advance_key();
                     } else {
                         provider.status = KeyStatus::Err(result.message.clone());
                     }
@@ -381,7 +387,7 @@ impl App {
             KeyCode::Backspace => {
                 if let Some(provider) = self.providers.get_mut(self.key_cursor) {
                     provider.key_text.pop();
-                    if matches!(provider.status, KeyStatus::Err(_)) {
+                    if matches!(provider.status, KeyStatus::Err(_) | KeyStatus::Warn(_)) {
                         provider.status = KeyStatus::Idle;
                     }
                 }
@@ -394,7 +400,7 @@ impl App {
                 if let Some(provider) = self.providers.get_mut(self.key_cursor) {
                     provider.key_text.push(c);
                     provider.keep_existing = false;
-                    if matches!(provider.status, KeyStatus::Err(_)) {
+                    if matches!(provider.status, KeyStatus::Err(_) | KeyStatus::Warn(_)) {
                         provider.status = KeyStatus::Idle;
                     }
                 }
@@ -567,26 +573,30 @@ impl App {
             }
         };
 
-        let validated: Vec<(String, Option<bool>, String)> = self
-            .selected()
-            .iter()
-            .map(|index| {
-                let provider = &self.providers[*index];
-                (
-                    provider.spec.id.to_string(),
-                    match &provider.status {
-                        KeyStatus::Ok(_) => Some(true),
-                        KeyStatus::Err(_) => Some(false),
-                        _ => None,
-                    },
-                    if provider.keep_existing {
-                        "existing".to_string()
-                    } else {
-                        "input".to_string()
-                    },
-                )
-            })
-            .collect();
+        let mut validation_warnings: Vec<String> = Vec::new();
+        let mut validated: Vec<(String, Option<bool>, String)> = Vec::new();
+        for index in self.selected() {
+            let provider = &self.providers[index];
+            let status = match &provider.status {
+                KeyStatus::Ok(_) => Some(true),
+                KeyStatus::Warn(message) => {
+                    validation_warnings
+                        .push(format!("{}: {}", provider.spec.display, message));
+                    None
+                }
+                KeyStatus::Err(_) => Some(false),
+                _ => None,
+            };
+            validated.push((
+                provider.spec.id.to_string(),
+                status,
+                if provider.keep_existing {
+                    "existing".to_string()
+                } else {
+                    "input".to_string()
+                },
+            ));
+        }
 
         let goose = self.goose.clone();
         let tx = self.tx.clone();
@@ -647,7 +657,13 @@ impl App {
                         .iter()
                         .map(|path| path.display().to_string())
                         .collect(),
-                    warnings: plan.warnings.iter().chain(commit.warnings.iter()).cloned().collect(),
+                    warnings: plan
+                        .warnings
+                        .iter()
+                        .chain(commit.warnings.iter())
+                        .cloned()
+                        .chain(validation_warnings)
+                        .collect(),
                     ..Report::default()
                 };
                 report.warnings.dedup();
@@ -982,6 +998,7 @@ fn draw_keys(frame: &mut Frame, app: &App, area: Rect) {
             KeyStatus::Ok(_) if provider.keep_existing => ("existing", OK),
             KeyStatus::Ok(_) => ("validated", OK),
             KeyStatus::Checking => ("checking", WARN),
+            KeyStatus::Warn(_) => ("service error", WARN),
             KeyStatus::Err(_) => ("error", ACCENT),
             KeyStatus::Idle => ("no key", MUTED),
         };
@@ -1082,6 +1099,10 @@ fn draw_keys(frame: &mut Frame, app: &App, area: Rect) {
         KeyStatus::Ok(message) => lines.push(Line::from(Span::styled(
             format!("✓ {message}"),
             Style::new().fg(OK),
+        ))),
+        KeyStatus::Warn(message) => lines.push(Line::from(Span::styled(
+            format!("! {message}"),
+            Style::new().fg(WARN),
         ))),
         KeyStatus::Err(message) => lines.push(Line::from(Span::styled(
             format!("✗ {message}"),

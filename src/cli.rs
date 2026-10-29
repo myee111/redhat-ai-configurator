@@ -261,6 +261,19 @@ fn run_non_interactive(args: &Args, config_dir: &Path) -> Result<u8> {
             let result = netcheck::validate(&spec.validate_url(), &key);
             if result.ok {
                 validated.insert(spec.id.to_string(), Some(true));
+            } else if result.server_error() {
+                warnings.push(format!(
+                    "{}: {} The key was not verified; the service is failing, so you can continue.",
+                    spec.display, result.message
+                ));
+                validated.insert(spec.id.to_string(), Some(false));
+                if args.require_validation {
+                    return Err(Fail::new(
+                        code::NETWORK,
+                        format!("{}: {}", spec.display, result.message),
+                    )
+                    .hint("The service returned a server error, not a key rejection."));
+                }
             } else if result.status.is_none() {
                 warnings.push(format!(
                     "{}: {} This is expected if the VPN is in the wrong state.",
@@ -444,7 +457,7 @@ fn run_list_models(args: &Args) -> Result<u8> {
         };
         let result = netcheck::validate(&spec.validate_url(), key);
         if !result.ok {
-            let code = if result.status.is_none() {
+            let code = if result.status.is_none() || result.server_error() {
                 code::NETWORK
             } else {
                 code::KEY

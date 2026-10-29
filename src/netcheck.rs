@@ -42,6 +42,11 @@ impl Validation {
             message: message.into(),
         }
     }
+
+    /// A 5xx means the service failed, not that the key was rejected.
+    pub fn server_error(&self) -> bool {
+        self.status.is_some_and(|status| status >= 500)
+    }
 }
 
 fn agent(timeout: Duration) -> ureq::Agent {
@@ -77,15 +82,17 @@ fn request_models(base: &str, key: &str, style: AuthStyle) -> Result<(u16, Strin
     }
 }
 
-/// Validate a key against `{base}/models`, retrying with the other auth
-/// header when the first is rejected.
+/// Validate a key against `{base}/models`. A rejected auth style is retried
+/// with the other header, and so is a 5xx (some gateways answer 500 for the
+/// wrong auth style). The response body of a 5xx is included so the user can
+/// see what the service actually said.
 pub fn validate(base: &str, raw_key: &str) -> Validation {
     let key: String = raw_key.chars().filter(|c| !c.is_whitespace()).collect();
     if key.is_empty() {
         return Validation::fail(None, "Paste your API key first.");
     }
 
-    let mut last_status = None;
+    let mut attempts: Vec<(u16, String)> = Vec::new();
     for style in [AuthStyle::Bearer, AuthStyle::XApiKey] {
         match request_models(base, &key, style) {
             Ok((status, body)) if (200..300).contains(&status) => {
@@ -106,31 +113,72 @@ pub fn validate(base: &str, raw_key: &str) -> Validation {
                     models,
                 };
             }
-            Ok((status, _)) => {
-                last_status = Some(status);
-                if status != 401 {
+            Ok((status, body)) => {
+                let retry = matches!(status, 401 | 403) || status >= 500;
+                attempts.push((status, body));
+                if !retry {
                     break;
                 }
             }
             Err(error) => {
-                return Validation::fail(
-                    None,
-                    format!(
-                        "Could not reach the service ({error}). Check your network and the VPN requirement, then try again."
-                    ),
-                );
+                if attempts.is_empty() {
+                    return Validation::fail(
+                        None,
+                        format!(
+                            "Could not reach the service ({error}). Check your network and the VPN requirement, then try again."
+                        ),
+                    );
+                }
+                break;
             }
         }
     }
 
-    let message = match last_status {
-        Some(401) => "That key was rejected. Check that you copied the whole key, or create a new one.".to_string(),
-        Some(403) => "This key has no access to this service. Check your entitlement or create a new key.".to_string(),
-        Some(404) => "The service did not recognise this endpoint. Check the VPN requirement for this step.".to_string(),
-        Some(status) => format!("The service answered with HTTP {status}. Try again, or create a new key."),
-        None => "The key could not be validated.".to_string(),
+    // A real auth rejection is more informative than a 5xx; prefer it.
+    let chosen = attempts
+        .iter()
+        .find(|(status, _)| matches!(*status, 401 | 403))
+        .or_else(|| attempts.iter().find(|(status, _)| *status >= 500))
+        .or_else(|| attempts.first());
+
+    let Some((status, body)) = chosen else {
+        return Validation::fail(None, "The key could not be validated.");
     };
-    Validation::fail(last_status, message)
+    let status = *status;
+
+    let message = match status {
+        401 => "That key was rejected. Check that you copied the whole key, or create a new one.".to_string(),
+        403 => "This key has no access to this service. Check your entitlement or create a new key.".to_string(),
+        404 => "The service did not recognise this endpoint. Check the VPN requirement for this step.".to_string(),
+        status if status >= 500 => {
+            let detail = body_snippet(body, &key);
+            match detail {
+                Some(detail) => format!(
+                    "The service failed with HTTP {status} (a service error, not a key rejection). Response: {detail}"
+                ),
+                None => format!(
+                    "The service failed with HTTP {status} (a service error, not a key rejection). Try again later."
+                ),
+            }
+        }
+        status => format!("The service answered with HTTP {status}. Try again, or create a new key."),
+    };
+    Validation::fail(Some(status), message)
+}
+
+/// Short, single-line, key-redacted view of an error body.
+fn body_snippet(body: &str, key: &str) -> Option<String> {
+    let redacted = body.replace(key, "***");
+    let collapsed = redacted.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return None;
+    }
+    let limit = 300;
+    if collapsed.chars().count() > limit {
+        Some(format!("{}…", collapsed.chars().take(limit).collect::<String>()))
+    } else {
+        Some(collapsed)
+    }
 }
 
 fn parse_models(body: &str) -> Vec<String> {
@@ -193,31 +241,29 @@ mod tests {
         assert!(result.status.is_none());
     }
 
-    fn serve(responses: Vec<(bool, &'static str)>) -> (String, std::thread::JoinHandle<()>) {
+    fn serve(responses: Vec<(u16, &'static str)>) -> (String, std::thread::JoinHandle<()>) {
         use std::io::{Read, Write};
         use std::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let handle = std::thread::spawn(move || {
-            for (ok, body) in responses {
+            for (status, body) in responses {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut buffer = [0u8; 4096];
-                let read = stream.read(&mut buffer).unwrap_or(0);
-                let request = String::from_utf8_lossy(&buffer[..read]).to_ascii_lowercase();
-                let use_x_api_key = ok && !request.contains("authorization:");
-                let status = if ok { "200 OK" } else { "401 Unauthorized" };
-                let payload = if ok {
-                    body
-                } else {
-                    r#"{"error":"unauthorized"}"#
+                let _ = stream.read(&mut buffer).unwrap_or(0);
+                let reason = match status {
+                    200 => "OK",
+                    401 => "Unauthorized",
+                    500 => "Internal Server Error",
+                    _ => "Status",
                 };
+                let payload = if body.is_empty() { "{}" } else { body };
                 let response = format!(
-                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
                     payload.len()
                 );
                 let _ = stream.write_all(response.as_bytes());
-                let _ = use_x_api_key;
             }
         });
         (format!("http://{address}/v1"), handle)
@@ -225,7 +271,7 @@ mod tests {
 
     #[test]
     fn accepts_a_bearer_key() {
-        let (base, server) = serve(vec![(true, r#"{"data":[{"id":"m1"},{"id":"m2"}]}"#)]);
+        let (base, server) = serve(vec![(200, r#"{"data":[{"id":"m1"},{"id":"m2"}]}"#)]);
         let result = validate(&base, "secret");
         server.join().unwrap();
         assert!(result.ok);
@@ -236,8 +282,8 @@ mod tests {
     #[test]
     fn retries_with_x_api_key_after_401() {
         let (base, server) = serve(vec![
-            (false, ""),
-            (true, r#"{"models":[{"name":"claude"}]}"#),
+            (401, ""),
+            (200, r#"{"models":[{"name":"claude"}]}"#),
         ]);
         let result = validate(&base, "secret");
         server.join().unwrap();
@@ -247,12 +293,39 @@ mod tests {
     }
 
     #[test]
+    fn retries_with_x_api_key_after_a_server_error() {
+        let (base, server) = serve(vec![
+            (500, r#"{"error":"unknown auth style"}"#),
+            (200, r#"{"data":[{"id":"m1"}]}"#),
+        ]);
+        let result = validate(&base, "secret");
+        server.join().unwrap();
+        assert!(result.ok);
+        assert_eq!(result.auth, Some(AuthStyle::XApiKey));
+    }
+
+    #[test]
     fn surfaces_a_rejected_key() {
-        let (base, server) = serve(vec![(false, ""), (false, "")]);
+        let (base, server) = serve(vec![(401, ""), (401, "")]);
         let result = validate(&base, "secret");
         server.join().unwrap();
         assert!(!result.ok);
         assert_eq!(result.status, Some(401));
         assert!(result.message.contains("rejected"));
+    }
+
+    #[test]
+    fn includes_the_body_of_a_server_error_and_redacts_the_key() {
+        let (base, server) = serve(vec![
+            (500, r#"{"error":"upstream router failed","key":"secret"}"#),
+            (500, r#"{"error":"upstream router failed","key":"secret"}"#),
+        ]);
+        let result = validate(&base, "secret");
+        server.join().unwrap();
+        assert!(!result.ok);
+        assert!(result.server_error());
+        assert!(result.message.contains("not a key rejection"));
+        assert!(result.message.contains("upstream router failed"));
+        assert!(!result.message.contains("secret"));
     }
 }
