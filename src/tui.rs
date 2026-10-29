@@ -882,7 +882,12 @@ fn draw_preflight(frame: &mut Frame, app: &App, area: Rect) {
     );
 
     let mut lines = Vec::new();
-    if settings::endpoints().uses_placeholders() {
+    let selected_ids: Vec<&str> = app
+        .selected()
+        .iter()
+        .map(|index| app.providers[*index].spec.id)
+        .collect();
+    if settings::endpoints().uses_placeholders_for(selected_ids.iter().copied()) {
         lines.push(Line::from(Span::styled(
             "Endpoints are placeholders. Set RHAI_MAAS_BASE_URL and ENMAAS_BASE_URL",
             Style::new().fg(WARN),

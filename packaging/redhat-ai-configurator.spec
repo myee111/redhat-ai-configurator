@@ -1,7 +1,7 @@
 %global debug_package %{nil}
 
 Name:           redhat-ai-configurator
-Version:        0.1.0
+Version:        0.1.1
 Release:        1%{?dist}
 Summary:        Guided installer that configures goose for Red Hat AI MaaS and EnMaaS
 
@@ -63,5 +63,8 @@ cargo test --offline --locked
 %doc README.md
 
 %changelog
+* Thu Oct 29 2026 Matthew Yee <yee.matthew@gmail.com> - 0.1.1-1
+- Check placeholder warnings and doctor results only for configured providers
+
 * Thu Oct 29 2026 Matthew Yee <yee.matthew@gmail.com> - 0.1.0-1
 - Initial package

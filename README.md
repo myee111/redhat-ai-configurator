@@ -77,13 +77,14 @@ RHAI_MAAS_BASE_URL=https://maas.example.com/v1
 ENMAAS_BASE_URL=https://enmaas.example.com
 ```
 
-When the bases are still placeholders the UI and `--doctor` warn, and the
-non-interactive report includes a warning.
+When a selected provider's base is still a placeholder, the UI and
+`--doctor` warn, and the non-interactive report includes a warning. `--doctor`
+only checks the providers referenced by the existing `config.yaml`.
 
 ## Install
 
 ```sh
-sudo dnf install ./redhat-ai-configurator-0.1.0-1.el10.x86_64.rpm
+sudo dnf install ./redhat-ai-configurator-0.1.1-1.el10.x86_64.rpm
 ```
 
 Then run it **as yourself**, not as root:

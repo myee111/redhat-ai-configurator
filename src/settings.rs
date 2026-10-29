@@ -121,8 +121,14 @@ impl Endpoints {
             .then_some(self.enmaas_slack.as_str())
     }
 
-    pub fn uses_placeholders(&self) -> bool {
-        self.rhai_maas_base.contains("example.com") || self.enmaas_base.contains("example.com")
+    /// True when any of the given providers still points at a placeholder.
+    pub fn uses_placeholders_for<'a>(
+        &self,
+        providers: impl IntoIterator<Item = &'a str>,
+    ) -> bool {
+        providers
+            .into_iter()
+            .any(|provider| self.provider_base(provider).contains("example.com"))
     }
 }
 
@@ -181,10 +187,19 @@ mod tests {
     #[test]
     fn defaults_are_placeholders() {
         let endpoints = Endpoints::resolve(&BTreeMap::new(), &BTreeMap::new());
-        assert!(endpoints.uses_placeholders());
+        assert!(endpoints.uses_placeholders_for(["rhai-maas", "enmaas"]));
         assert_eq!(endpoints.provider_base("rhai-maas"), "https://maas.example.com/v1");
         assert_eq!(endpoints.provider_base("enmaas"), "https://enmaas.example.com");
         assert_eq!(endpoints.eligibility("enmaas"), None);
+    }
+
+    #[test]
+    fn placeholder_check_is_per_provider() {
+        let env = map(&[("RHAI_MAAS_BASE_URL", "https://maas.corp.test/v1")]);
+        let endpoints = Endpoints::resolve(&BTreeMap::new(), &env);
+        assert!(!endpoints.uses_placeholders_for(["rhai-maas"]));
+        assert!(endpoints.uses_placeholders_for(["enmaas"]));
+        assert!(endpoints.uses_placeholders_for(["rhai-maas", "enmaas"]));
     }
 
     #[test]
@@ -224,6 +239,6 @@ mod tests {
             ("RHAI_MAAS_BASE_URL", "https://maas.corp.test/v1"),
             ("ENMAAS_BASE_URL", "https://enmaas.corp.test"),
         ]);
-        assert!(!Endpoints::resolve(&BTreeMap::new(), &env).uses_placeholders());
+        assert!(!Endpoints::resolve(&BTreeMap::new(), &env).uses_placeholders_for(["rhai-maas", "enmaas"]));
     }
 }

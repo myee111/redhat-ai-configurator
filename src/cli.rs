@@ -313,7 +313,7 @@ fn run_non_interactive(args: &Args, config_dir: &Path) -> Result<u8> {
 
     let plan = apply::build(&selection)?;
     warnings.extend(plan.warnings.clone());
-    if crate::settings::endpoints().uses_placeholders() {
+    if crate::settings::endpoints().uses_placeholders_for(providers.iter().map(|spec| spec.id)) {
         warnings.push(
             "Service endpoints are still placeholders (example.com). Set RHAI_MAAS_BASE_URL and \
              ENMAAS_BASE_URL, or edit /etc/redhat-ai-configurator/endpoints.conf."
@@ -477,6 +477,50 @@ fn run_list_models(args: &Args) -> Result<u8> {
     Ok(0)
 }
 
+/// Providers a goose config actually references: the active provider plus any
+/// entries in the structured `providers:` block. Declarative names such as
+/// `enmaas-openai` are mapped back to their parent provider.
+fn configured_provider_ids(config_text: Option<&str>) -> Vec<&'static str> {
+    let Some(text) = config_text else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_yaml_ng::from_str::<serde_yaml_ng::Value>(text) else {
+        return Vec::new();
+    };
+
+    let mut names: Vec<String> = Vec::new();
+    for key in ["GOOSE_PROVIDER", "active_provider"] {
+        if let Some(name) = value.get(key).and_then(|value| value.as_str()) {
+            names.push(name.to_string());
+        }
+    }
+    if let Some(serde_yaml_ng::Value::Mapping(providers)) = value.get("providers") {
+        for key in providers.keys() {
+            if let Some(name) = key.as_str() {
+                names.push(name.to_string());
+            }
+        }
+    }
+
+    let mut ids: Vec<&'static str> = Vec::new();
+    for name in names {
+        let id = catalog::normalize_id(&name).or_else(|| {
+            catalog::all().iter().find_map(|spec| {
+                spec.declaratives
+                    .iter()
+                    .any(|declarative| declarative.name == name)
+                    .then_some(spec.id)
+            })
+        });
+        if let Some(id) = id
+            && !ids.contains(&id)
+        {
+            ids.push(id);
+        }
+    }
+    ids
+}
+
 struct CheckItem {
     name: String,
     ok: bool,
@@ -546,7 +590,14 @@ fn run_doctor(config_dir: &Path, format: Format) -> Result<u8> {
         },
     });
 
-    for declarative in catalog::all().iter().flat_map(|spec| spec.declaratives) {
+    let configured = configured_provider_ids(config_text.as_deref());
+    let checked: Vec<&'static ProviderSpec> = if configured.is_empty() {
+        catalog::all().iter().collect()
+    } else {
+        configured.iter().filter_map(|id| catalog::find(id)).collect()
+    };
+
+    for declarative in checked.iter().flat_map(|spec| spec.declaratives) {
         let path = config_dir
             .join("custom_providers")
             .join(format!("{}.json", declarative.name));
@@ -560,12 +611,16 @@ fn run_doctor(config_dir: &Path, format: Format) -> Result<u8> {
     let endpoints = crate::settings::endpoints();
     checks.push(CheckItem {
         name: "endpoints".into(),
-        ok: !endpoints.uses_placeholders(),
-        detail: format!("{} / {}", endpoints.rhai_maas_base, endpoints.enmaas_base),
+        ok: !endpoints.uses_placeholders_for(checked.iter().map(|spec| spec.id)),
+        detail: checked
+            .iter()
+            .map(|spec| endpoints.provider_base(spec.id))
+            .collect::<Vec<_>>()
+            .join(" / "),
     });
 
     let stored = secrets::existing_names(config_dir);
-    for spec in catalog::all() {
+    for spec in &checked {
         checks.push(CheckItem {
             name: format!("key {}", spec.id),
             ok: stored.contains(spec.secret),
@@ -577,7 +632,7 @@ fn run_doctor(config_dir: &Path, format: Format) -> Result<u8> {
         });
     }
 
-    for spec in catalog::all() {
+    for spec in &checked {
         let ok = netcheck::reachable(&spec.validate_url());
         checks.push(CheckItem {
             name: format!("reachable {}", spec.id),
@@ -615,4 +670,31 @@ fn run_doctor(config_dir: &Path, format: Format) -> Result<u8> {
         println!("{}", if ok { "All checks passed." } else { "Some checks failed." });
     }
     Ok(if ok { 0 } else { 1 })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn configured_ids_include_flat_and_structured_names() {
+        let text = "GOOSE_PROVIDER: rhai-maas\nactive_provider: enmaas\nproviders:\n  enmaas-openai:\n    enabled: true\n";
+        let ids = configured_provider_ids(Some(text));
+        assert!(ids.contains(&"rhai-maas"));
+        assert!(ids.contains(&"enmaas"));
+        assert_eq!(ids.len(), 2);
+    }
+
+    #[test]
+    fn configured_ids_map_declarative_names_to_providers() {
+        let ids = configured_provider_ids(Some("active_provider: enmaas-openai\n"));
+        assert_eq!(ids, vec!["enmaas"]);
+    }
+
+    #[test]
+    fn configured_ids_empty_without_a_provider() {
+        assert!(configured_provider_ids(None).is_empty());
+        assert!(configured_provider_ids(Some("GOOSE_MODEL: some-model\n")).is_empty());
+        assert!(configured_provider_ids(Some("providers: [unclosed\n")).is_empty());
+    }
 }

@@ -240,6 +240,41 @@ fn dry_run_writes_nothing() {
 }
 
 #[test]
+fn placeholder_warning_only_covers_selected_providers() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    let output = command(root)
+        .env_remove("ENMAAS_BASE_URL")
+        .env_remove("ENMAAS_KEY_PAGE")
+        .args([
+            "--non-interactive",
+            "--provider",
+            "rhai-maas",
+            "--dry-run",
+            "--key-file",
+            "-",
+            "--no-validate",
+            "--no-verify",
+            "--format",
+            "json",
+        ])
+        .write_stdin("RHAI_MAAS_API_KEY=x\n")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    let warnings = value["warnings"].as_array().unwrap();
+    assert!(
+        !warnings
+            .iter()
+            .any(|warning| warning.as_str().unwrap_or("").contains("placeholders")),
+        "{warnings:?}"
+    );
+}
+
+#[test]
 fn doctor_reports_missing_configuration() {
     let temp = tempfile::tempdir().unwrap();
     command(temp.path())
