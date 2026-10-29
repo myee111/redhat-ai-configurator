@@ -18,7 +18,11 @@ check: test
 lint:
 	cargo clippy --all-targets -- -D warnings
 
-tarballs: $(DIST)/$(NAME)-$(VERSION).tar.gz $(DIST)/$(NAME)-$(VERSION)-vendor.tar.gz
+# Always regenerate: the tarballs have no file prerequisites, so without this
+# `make rpm` would happily package a stale tree after a source edit.
+tarballs: $(DIST)
+	rm -f $(DIST)/$(NAME)-$(VERSION).tar.gz $(DIST)/$(NAME)-$(VERSION)-vendor.tar.gz
+	$(MAKE) $(DIST)/$(NAME)-$(VERSION).tar.gz $(DIST)/$(NAME)-$(VERSION)-vendor.tar.gz
 
 $(DIST):
 	mkdir -p $(DIST)
