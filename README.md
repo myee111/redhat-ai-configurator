@@ -58,16 +58,34 @@ one provider, change VPN state, and do the other.
 Resolution order: environment, then `/etc/redhat-ai-configurator/endpoints.conf`,
 then the placeholder defaults. Environment wins.
 
-| Variable | Meaning | Default |
-|---|---|---|
-| `RHAI_MAAS_BASE_URL` | OpenAI-compatible base, including `/v1` | `https://maas.example.com/v1` |
-| `RHAI_MAAS_KEY_PAGE` | Page where users create a key | `https://maas.example.com/keys` |
-| `RHAI_MAAS_HELP_URL` | Help link shown in the UI | `https://maas.example.com/docs` |
-| `ENMAAS_BASE_URL` | Anthropic-compatible root, **without** `/v1` | `https://enmaas.example.com` |
-| `ENMAAS_KEY_PAGE` | Page where users create a key | `https://enmaas.example.com/keys` |
-| `ENMAAS_HELP_URL` | Help link shown in the UI | `https://enmaas.example.com/docs` |
-| `ENMAAS_ELIGIBILITY_URL` | Access-request page (optional) | unset |
-| `ENMAAS_SLACK` | Help channel shown in the UI (optional) | unset |
+**Only two settings are mandatory, and only for the provider you configure:**
+
+| Variable | Required | Meaning | Default |
+|---|---|---|---|
+| `RHAI_MAAS_BASE_URL` | **Yes, when configuring `rhai-maas`** | OpenAI-compatible base, including `/v1` | `https://maas.example.com/v1` |
+| `ENMAAS_BASE_URL` | **Yes, when configuring `enmaas`** | Anthropic-compatible root, **without** `/v1` | `https://enmaas.example.com` |
+
+Everything below only changes what the installer shows; none of it is needed
+for a working configuration:
+
+| Variable | Required | Meaning | Default |
+|---|---|---|---|
+| `RHAI_MAAS_KEY_PAGE` | Recommended | Page where users create a key | `https://maas.example.com/keys` |
+| `RHAI_MAAS_HELP_URL` | Recommended | Help link shown in the UI | `https://maas.example.com/docs` |
+| `ENMAAS_KEY_PAGE` | Recommended | Page where users create a key | `https://enmaas.example.com/keys` |
+| `ENMAAS_HELP_URL` | Recommended | Help link shown in the UI | `https://enmaas.example.com/docs` |
+| `ENMAAS_ELIGIBILITY_URL` | Optional | Access-request page; hidden when unset | unset |
+| `ENMAAS_SLACK` | Optional | Help channel; hidden when unset | unset |
+
+Notes:
+
+- If you configure only one provider, you do not need any variable for the
+  other one.
+- Key pages and help links are not required to run, but leaving them at
+  `example.com` gives users a dead link, so set them in practice.
+- The whole file is optional. Omitted or blank values fall back to the default;
+  a blank base URL is **not** a way to disable a provider — just do not
+  configure that provider.
 
 The same keys work in the config file:
 
