@@ -1,9 +1,10 @@
 //! Service endpoints, kept out of the source so a public build contains no
 //! internal hostnames. Resolution order:
 //!
-//! 1. environment variables
-//! 2. `/etc/redhat-ai-configurator/endpoints.conf`
-//! 3. the placeholder defaults below
+//! 1. command-line overrides (`--rhai-maas-base-url`, `--enmaas-base-url`)
+//! 2. environment variables
+//! 3. `/etc/redhat-ai-configurator/endpoints.conf`
+//! 4. the placeholder defaults below
 //!
 //! The defaults are deliberately examples, so a fresh install cannot silently
 //! talk to the wrong service.
@@ -54,14 +55,24 @@ impl Default for Endpoints {
 }
 
 impl Endpoints {
-    /// Build the effective endpoints. Environment wins over the config file.
-    pub fn resolve(file: &BTreeMap<String, String>, env: &BTreeMap<String, String>) -> Self {
+    /// Build the effective endpoints, with command-line overrides winning over
+    /// both the environment and the config file.
+    pub fn resolve_with(
+        file: &BTreeMap<String, String>,
+        env: &BTreeMap<String, String>,
+        overrides: Option<&BTreeMap<String, String>>,
+    ) -> Self {
         let mut endpoints = Self::default();
         let value = |key: &str| {
-            env.get(key)
-                .or_else(|| file.get(key))
-                .map(|raw| raw.trim().to_string())
-                .filter(|raw| !raw.is_empty())
+            let clean = |map: &BTreeMap<String, String>| {
+                map.get(key)
+                    .map(|raw| raw.trim().to_string())
+                    .filter(|raw| !raw.is_empty())
+            };
+            overrides
+                .and_then(clean)
+                .or_else(|| clean(env))
+                .or_else(|| clean(file))
         };
         if let Some(v) = value("RHAI_MAAS_BASE_URL") {
             endpoints.rhai_maas_base = v;
@@ -130,6 +141,29 @@ impl Endpoints {
             .into_iter()
             .any(|provider| self.provider_base(provider).contains("example.com"))
     }
+
+    /// Warn when a base URL does not have the shape goose expects. This is a
+    /// warning rather than an error because the value may come from a shared
+    /// config file that this run must not break.
+    pub fn shape_warning(&self, provider: &str) -> Option<String> {
+        let base = self.provider_base(provider).trim_end_matches('/');
+        if base.contains("example.com") {
+            return None;
+        }
+        if provider == "rhai-maas" && !base.ends_with("/v1") {
+            return Some(format!(
+                "RHAI_MAAS_BASE_URL should include /v1 (currently {base}); goose appends \
+                 /chat/completions to it."
+            ));
+        }
+        if provider != "rhai-maas" && base.ends_with("/v1") {
+            return Some(format!(
+                "ENMAAS_BASE_URL should be the host root without /v1 (currently {base}); goose \
+                 appends v1/messages, which would become v1/v1/messages."
+            ));
+        }
+        None
+    }
 }
 
 fn parse_config(text: &str) -> BTreeMap<String, String> {
@@ -167,9 +201,26 @@ fn env_values() -> BTreeMap<String, String> {
 
 static CACHE: OnceLock<Endpoints> = OnceLock::new();
 
+/// Base URLs supplied on the command line. Installed once, before the first
+/// `endpoints()` call.
+static CLI_OVERRIDES: OnceLock<BTreeMap<String, String>> = OnceLock::new();
+
+static NO_OVERRIDES: BTreeMap<String, String> = BTreeMap::new();
+
+/// Install endpoint overrides from the command line. Later calls are ignored,
+/// because the effective endpoints are resolved only once per process.
+pub fn set_overrides(overrides: BTreeMap<String, String>) {
+    let _ = CLI_OVERRIDES.set(overrides);
+}
+
 pub fn endpoints() -> &'static Endpoints {
     CACHE.get_or_init(|| {
-        Endpoints::resolve(&read_config(Path::new(CONFIG_PATH)), &env_values())
+        let overrides = CLI_OVERRIDES.get().unwrap_or(&NO_OVERRIDES);
+        Endpoints::resolve_with(
+            &read_config(Path::new(CONFIG_PATH)),
+            &env_values(),
+            Some(overrides),
+        )
     })
 }
 
@@ -186,7 +237,7 @@ mod tests {
 
     #[test]
     fn defaults_are_placeholders() {
-        let endpoints = Endpoints::resolve(&BTreeMap::new(), &BTreeMap::new());
+        let endpoints = Endpoints::resolve_with(&BTreeMap::new(), &BTreeMap::new(), None);
         assert!(endpoints.uses_placeholders_for(["rhai-maas", "enmaas"]));
         assert_eq!(endpoints.provider_base("rhai-maas"), "https://maas.example.com/v1");
         assert_eq!(endpoints.provider_base("enmaas"), "https://enmaas.example.com");
@@ -196,7 +247,7 @@ mod tests {
     #[test]
     fn placeholder_check_is_per_provider() {
         let env = map(&[("RHAI_MAAS_BASE_URL", "https://maas.corp.test/v1")]);
-        let endpoints = Endpoints::resolve(&BTreeMap::new(), &env);
+        let endpoints = Endpoints::resolve_with(&BTreeMap::new(), &env, None);
         assert!(!endpoints.uses_placeholders_for(["rhai-maas"]));
         assert!(endpoints.uses_placeholders_for(["enmaas"]));
         assert!(endpoints.uses_placeholders_for(["rhai-maas", "enmaas"]));
@@ -209,7 +260,7 @@ mod tests {
             ("RHAI_MAAS_BASE_URL", "https://env.example/v1"),
             ("ENMAAS_SLACK", "#help"),
         ]);
-        let endpoints = Endpoints::resolve(&file, &env);
+        let endpoints = Endpoints::resolve_with(&file, &env, None);
         assert_eq!(endpoints.rhai_maas_base, "https://env.example/v1");
         assert_eq!(endpoints.slack("enmaas"), Some("#help"));
     }
@@ -217,8 +268,52 @@ mod tests {
     #[test]
     fn blank_values_are_ignored() {
         let env = map(&[("ENMAAS_BASE_URL", "   ")]);
-        let endpoints = Endpoints::resolve(&BTreeMap::new(), &env);
+        let endpoints = Endpoints::resolve_with(&BTreeMap::new(), &env, None);
         assert_eq!(endpoints.enmaas_base, "https://enmaas.example.com");
+    }
+
+    #[test]
+    fn command_line_overrides_win_over_the_environment() {
+        let file = map(&[("RHAI_MAAS_BASE_URL", "https://file.example/v1")]);
+        let env = map(&[("RHAI_MAAS_BASE_URL", "https://env.example/v1")]);
+        let overrides = map(&[("RHAI_MAAS_BASE_URL", "https://cli.example/v1")]);
+        let endpoints = Endpoints::resolve_with(&file, &env, Some(&overrides));
+        assert_eq!(endpoints.rhai_maas_base, "https://cli.example/v1");
+        assert_eq!(endpoints.enmaas_base, "https://enmaas.example.com");
+    }
+
+    #[test]
+    fn blank_overrides_do_not_mask_a_configured_value() {
+        let env = map(&[("ENMAAS_BASE_URL", "https://enmaas.corp.test")]);
+        let overrides = map(&[("ENMAAS_BASE_URL", "  ")]);
+        let endpoints = Endpoints::resolve_with(&BTreeMap::new(), &env, Some(&overrides));
+        assert_eq!(endpoints.enmaas_base, "https://enmaas.corp.test");
+    }
+
+    #[test]
+    fn shape_warning_flags_the_wrong_suffix_for_each_provider() {
+        let env = map(&[
+            ("RHAI_MAAS_BASE_URL", "https://maas.corp.test"),
+            ("ENMAAS_BASE_URL", "https://enmaas.corp.test/v1"),
+        ]);
+        let endpoints = Endpoints::resolve_with(&BTreeMap::new(), &env, None);
+        assert!(endpoints.shape_warning("rhai-maas").is_some());
+        assert!(endpoints.shape_warning("enmaas").is_some());
+    }
+
+    #[test]
+    fn shape_warning_is_quiet_for_correct_and_placeholder_bases() {
+        let fresh = Endpoints::resolve_with(&BTreeMap::new(), &BTreeMap::new(), None);
+        assert_eq!(fresh.shape_warning("rhai-maas"), None);
+        assert_eq!(fresh.shape_warning("enmaas"), None);
+
+        let env = map(&[
+            ("RHAI_MAAS_BASE_URL", "https://maas.corp.test/v1/"),
+            ("ENMAAS_BASE_URL", "https://enmaas.corp.test/"),
+        ]);
+        let endpoints = Endpoints::resolve_with(&BTreeMap::new(), &env, None);
+        assert_eq!(endpoints.shape_warning("rhai-maas"), None);
+        assert_eq!(endpoints.shape_warning("enmaas"), None);
     }
 
     #[test]
@@ -239,6 +334,9 @@ mod tests {
             ("RHAI_MAAS_BASE_URL", "https://maas.corp.test/v1"),
             ("ENMAAS_BASE_URL", "https://enmaas.corp.test"),
         ]);
-        assert!(!Endpoints::resolve(&BTreeMap::new(), &env).uses_placeholders_for(["rhai-maas", "enmaas"]));
+        assert!(
+            !Endpoints::resolve_with(&BTreeMap::new(), &env, None)
+                .uses_placeholders_for(["rhai-maas", "enmaas"])
+        );
     }
 }

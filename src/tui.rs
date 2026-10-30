@@ -905,14 +905,23 @@ fn draw_preflight(frame: &mut Frame, app: &App, area: Rect) {
         .collect();
     if settings::endpoints().uses_placeholders_for(selected_ids.iter().copied()) {
         lines.push(Line::from(Span::styled(
-            "Endpoints are placeholders. Set RHAI_MAAS_BASE_URL and ENMAAS_BASE_URL",
+            "Endpoints are placeholders. Pass --rhai-maas-base-url and --enmaas-base-url,",
             Style::new().fg(WARN),
         )));
         lines.push(Line::from(Span::styled(
-            "or edit /etc/redhat-ai-configurator/endpoints.conf before continuing.",
+            "set RHAI_MAAS_BASE_URL and ENMAAS_BASE_URL, or edit endpoints.conf.",
             Style::new().fg(WARN),
         )));
         lines.push(Line::from(""));
+    }
+    for spec in app
+        .selected()
+        .iter()
+        .map(|index| app.providers[*index].spec)
+    {
+        if let Some(warning) = settings::endpoints().shape_warning(spec.id) {
+            lines.push(Line::from(Span::styled(warning, Style::new().fg(WARN))));
+        }
     }
     for provider in &app.providers {
         let (dot, style) = match provider.reachable {

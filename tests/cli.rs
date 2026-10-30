@@ -275,6 +275,158 @@ fn placeholder_warning_only_covers_selected_providers() {
 }
 
 #[test]
+fn base_url_flags_override_the_environment() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    command(root)
+        .args([
+            "--non-interactive",
+            "--provider",
+            "rhai-maas",
+            "--rhai-maas-base-url",
+            " https://cli.test/v1/ ",
+            "--key-file",
+            "-",
+            "--no-validate",
+            "--no-verify",
+        ])
+        .write_stdin("RHAI_MAAS_API_KEY=x\n")
+        .assert()
+        .success();
+
+    let provider: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(root.join("config/custom_providers/rhai-maas.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(provider["base_url"], "https://cli.test/v1");
+}
+
+#[test]
+fn base_url_flag_shape_is_validated() {
+    let temp = tempfile::tempdir().unwrap();
+    command(temp.path())
+        .args([
+            "--non-interactive",
+            "--provider",
+            "rhai-maas",
+            "--rhai-maas-base-url",
+            "maas.test/v1",
+            "--no-validate",
+            "--no-verify",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("must start with http"));
+
+    command(temp.path())
+        .args([
+            "--non-interactive",
+            "--provider",
+            "rhai-maas",
+            "--rhai-maas-base-url",
+            "https://maas.test",
+            "--no-validate",
+            "--no-verify",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("must include /v1"));
+
+    command(temp.path())
+        .args([
+            "--non-interactive",
+            "--provider",
+            "enmaas",
+            "--enmaas-base-url",
+            "https://enmaas.test/v1",
+            "--no-validate",
+            "--no-verify",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("without /v1"));
+}
+
+#[test]
+fn placeholder_endpoint_is_a_warning_without_require_validation() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = command(temp.path())
+        .env_remove("RHAI_MAAS_BASE_URL")
+        .env_remove("ENMAAS_BASE_URL")
+        .args([
+            "--non-interactive",
+            "--provider",
+            "rhai-maas",
+            "--key-file",
+            "-",
+            "--no-validate",
+            "--no-verify",
+            "--format",
+            "json",
+        ])
+        .write_stdin("RHAI_MAAS_API_KEY=x\n")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    let warnings = serde_json::to_string(&value["warnings"]).unwrap();
+    assert!(warnings.contains("placeholders"), "{warnings}");
+}
+
+#[test]
+fn require_validation_rejects_placeholder_endpoints() {
+    let temp = tempfile::tempdir().unwrap();
+    command(temp.path())
+        .env_remove("RHAI_MAAS_BASE_URL")
+        .env_remove("ENMAAS_BASE_URL")
+        .args([
+            "--non-interactive",
+            "--provider",
+            "rhai-maas",
+            "--key-file",
+            "-",
+            "--require-validation",
+            "--no-verify",
+        ])
+        .write_stdin("RHAI_MAAS_API_KEY=x\n")
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("placeholders"))
+        .stderr(predicate::str::contains("--rhai-maas-base-url"));
+}
+
+#[test]
+fn base_url_flag_clears_the_placeholder_warning() {
+    let temp = tempfile::tempdir().unwrap();
+    let output = command(temp.path())
+        .env_remove("RHAI_MAAS_BASE_URL")
+        .args([
+            "--non-interactive",
+            "--provider",
+            "rhai-maas",
+            "--rhai-maas-base-url",
+            "https://maas.test/v1",
+            "--key-file",
+            "-",
+            "--no-validate",
+            "--no-verify",
+            "--format",
+            "json",
+        ])
+        .write_stdin("RHAI_MAAS_API_KEY=x\n")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let value: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    let warnings = serde_json::to_string(&value["warnings"]).unwrap();
+    assert!(!warnings.contains("placeholders"), "{warnings}");
+}
+
+#[test]
 fn doctor_reports_missing_configuration() {
     let temp = tempfile::tempdir().unwrap();
     command(temp.path())

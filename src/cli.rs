@@ -47,6 +47,16 @@ pub struct Args {
     #[arg(long, value_name = "ID", value_delimiter = ',')]
     pub provider: Vec<String>,
 
+    /// Base URL for rhai-maas, including /v1. Overrides the environment and
+    /// endpoints.conf.
+    #[arg(long, value_name = "URL")]
+    pub rhai_maas_base_url: Option<String>,
+
+    /// Base URL for enmaas, the host root without /v1. Overrides the
+    /// environment and endpoints.conf.
+    #[arg(long, value_name = "URL")]
+    pub enmaas_base_url: Option<String>,
+
     /// Read keys from NAME=value file, or - for stdin.
     #[arg(long, value_name = "PATH")]
     pub key_file: Option<String>,
@@ -72,6 +82,8 @@ pub struct Args {
     pub no_validate: bool,
 
     /// Fail when a key could not be validated (for example on the wrong VPN).
+    /// Also refuses to write a configuration whose selected provider still has
+    /// a placeholder endpoint.
     #[arg(long)]
     pub require_validation: bool,
 
@@ -108,6 +120,8 @@ pub struct Args {
 }
 
 pub fn run(args: Args) -> Result<u8> {
+    crate::settings::set_overrides(endpoint_overrides(&args)?);
+
     let config_dir = platform::config_dir(args.config_dir.as_deref());
 
     if platform::is_root() && !args.allow_root {
@@ -142,6 +156,59 @@ pub fn run(args: Args) -> Result<u8> {
 
     let goose = apply::preflight_goose()?;
     crate::tui::run(config_dir, goose)
+}
+
+/// Validate the base-URL flags and turn them into endpoint overrides. Flags are
+/// strict because the user typed them for this run, while values from the
+/// environment or `endpoints.conf` only produce a warning so a shared file
+/// cannot break every invocation.
+fn endpoint_overrides(args: &Args) -> Result<BTreeMap<String, String>> {
+    let mut overrides = BTreeMap::new();
+    let flags = [
+        (
+            "--rhai-maas-base-url",
+            "RHAI_MAAS_BASE_URL",
+            true,
+            args.rhai_maas_base_url.as_deref(),
+        ),
+        (
+            "--enmaas-base-url",
+            "ENMAAS_BASE_URL",
+            false,
+            args.enmaas_base_url.as_deref(),
+        ),
+    ];
+
+    for (flag, key, needs_v1, raw) in flags {
+        let Some(raw) = raw else { continue };
+        let value = raw.trim();
+        if value.is_empty() {
+            return Err(Fail::new(code::USAGE, format!("{flag} cannot be empty."))
+                .hint("Omit the flag to use the environment, endpoints.conf, or the default."));
+        }
+        if !(value.starts_with("http://") || value.starts_with("https://")) {
+            return Err(Fail::new(
+                code::USAGE,
+                format!("{flag} must start with http:// or https://."),
+            )
+            .hint(format!("Got: {value}")));
+        }
+        let value = value.trim_end_matches('/');
+        if needs_v1 && !value.ends_with("/v1") {
+            return Err(Fail::new(code::USAGE, format!("{flag} must include /v1."))
+                .hint("goose appends /chat/completions to an OpenAI-compatible base."));
+        }
+        if !needs_v1 && value.ends_with("/v1") {
+            return Err(Fail::new(
+                code::USAGE,
+                format!("{flag} must be the host root, without /v1."),
+            )
+            .hint("goose appends v1/messages; including /v1 would make it v1/v1/messages."));
+        }
+        overrides.insert(key.to_string(), value.to_string());
+    }
+
+    Ok(overrides)
 }
 
 fn parse_providers(raw: &[String]) -> Result<Vec<&'static ProviderSpec>> {
@@ -247,6 +314,35 @@ fn run_non_interactive(args: &Args, config_dir: &Path) -> Result<u8> {
     let providers = parse_providers(&args.provider)?;
     let (keys, sources, mut warnings) = key_inputs(args, &providers)?;
 
+    let endpoints = crate::settings::endpoints();
+    let placeholders: Vec<&str> = providers
+        .iter()
+        .map(|spec| spec.id)
+        .filter(|id| endpoints.uses_placeholders_for([*id]))
+        .collect();
+    if !placeholders.is_empty() {
+        let which = placeholders.join(", ");
+        let message =
+            format!("Service endpoints for {which} are still placeholders (example.com).");
+        if args.require_validation {
+            return Err(Fail::new(code::USAGE, message)
+                .hint(
+                    "Set --rhai-maas-base-url and --enmaas-base-url, the matching environment \
+                     variables, or /etc/redhat-ai-configurator/endpoints.conf.",
+                )
+                .hint("Drop --require-validation to write the configuration anyway."));
+        }
+        warnings.push(format!(
+            "{message} Set --rhai-maas-base-url / --enmaas-base-url, the matching environment \
+             variables, or /etc/redhat-ai-configurator/endpoints.conf."
+        ));
+    }
+    for spec in &providers {
+        if let Some(warning) = endpoints.shape_warning(spec.id) {
+            warnings.push(warning);
+        }
+    }
+
     let mut validated: BTreeMap<String, Option<bool>> = BTreeMap::new();
     if !args.no_validate {
         for spec in &providers {
@@ -326,13 +422,6 @@ fn run_non_interactive(args: &Args, config_dir: &Path) -> Result<u8> {
 
     let plan = apply::build(&selection)?;
     warnings.extend(plan.warnings.clone());
-    if crate::settings::endpoints().uses_placeholders_for(providers.iter().map(|spec| spec.id)) {
-        warnings.push(
-            "Service endpoints are still placeholders (example.com). Set RHAI_MAAS_BASE_URL and \
-             ENMAAS_BASE_URL, or edit /etc/redhat-ai-configurator/endpoints.conf."
-                .to_string(),
-        );
-    }
 
     let provider_reports: Vec<ProviderReport> = providers
         .iter()
@@ -381,7 +470,7 @@ fn run_non_interactive(args: &Args, config_dir: &Path) -> Result<u8> {
         error: None,
         error_code: None,
     };
-    report.warnings = dedup(warnings);
+    report.warnings = dedup(warnings.clone());
 
     if args.dry_run {
         emit(&report, args.format);
@@ -402,7 +491,8 @@ fn run_non_interactive(args: &Args, config_dir: &Path) -> Result<u8> {
         .backups
         .first()
         .map(|backup| backup.path.display().to_string());
-    report.warnings = dedup(commit.warnings.clone());
+    warnings.extend(commit.warnings.clone());
+    report.warnings = dedup(warnings);
 
     if !args.no_verify {
         let check = runner::info_check(&goose.path);
